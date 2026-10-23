@@ -1,0 +1,43 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Runtime outputs (regenerated each run)
+events.csv
+event_snapshots/
+
+# Training artifacts (large binary files — regenerated via train_custom_ppe.py)
+runs/
+
+# Training dataset (32MB+ images — download separately or use Roboflow)
+Data/
+
+# Model weights (large .pt files — downloaded or trained locally)
+weights/
+*.pt
+
+# Generated demo assets (regenerated via generate_demo_assets.py)
+demo_video.mp4
+
+# Generated presentation (rebuild via create_presentation.py if needed)
+PPE_Safety_Monitoring_Presentation.pptx
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+Thumbs.db
+.DS_Store
+~$*

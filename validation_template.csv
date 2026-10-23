@@ -1,0 +1,9 @@
+trial_id,recording_session,scenario,ground_truth_helmet,ground_truth_vest,ground_truth_crossed,ground_truth_direction,system_helmet,system_vest,system_overall,event_type,warning_activated,latency_ms,reviewer_notes
+1,session_01,both_ppe_worn,PRESENT,PRESENT,yes,positive,,,,,,,
+2,session_01,helmet_missing,MISSING,PRESENT,yes,positive,,,,,,,
+3,session_01,vest_missing,PRESENT,MISSING,yes,positive,,,,,,,
+4,session_01,both_missing,MISSING,MISSING,yes,positive,,,,,,,
+5,session_01,helmet_carried_not_worn,MISSING,PRESENT,yes,positive,,,,,,,
+6,session_01,worker_occluded,UNKNOWN,UNKNOWN,yes,positive,,,,,,,
+7,session_01,compliant_parallel_walk,PRESENT,PRESENT,no,none,,,,,,,
+8,session_01,multiple_workers,varies,varies,varies,varies,,,,,,,
