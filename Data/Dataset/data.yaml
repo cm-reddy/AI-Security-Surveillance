@@ -1,0 +1,6 @@
+train: C:/Users/sachi/Downloads/ppe_webcam_poc/Data/DATASET/train/images
+val: C:/Users/sachi/Downloads/ppe_webcam_poc/Data/DATASET/valid/images
+test: C:/Users/sachi/Downloads/ppe_webcam_poc/Data/DATASET/test/images
+
+nc: 6
+names: ['BorderLine', 'Helmet', 'No_Helmet', 'No_Vest', 'Person', 'Vest']

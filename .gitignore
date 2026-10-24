@@ -10,20 +10,6 @@ __pycache__/
 *.pyd
 .pytest_cache/
 
-# Runtime outputs (regenerated each run)
-events.csv
-event_snapshots/
-
-# Training artifacts (large binary files — regenerated via train_custom_ppe.py)
-runs/
-
-# Training dataset (32MB+ images — download separately or use Roboflow)
-Data/
-
-# Model weights (large .pt files — downloaded or trained locally)
-weights/
-*.pt
-
 # Generated demo assets (regenerated via generate_demo_assets.py)
 demo_video.mp4
 
