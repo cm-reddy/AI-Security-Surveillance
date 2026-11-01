@@ -27,12 +27,18 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from camera_manager import CameraManager, probe_source
+
 try:
     import winsound  # Windows only
 except ImportError:  # pragma: no cover - depends on operating system
     winsound = None
 
-DEFAULT_HF_MODEL = "hf:Hansung-Cho/yolov8-ppe-detection:best.pt"
+DEFAULT_CUSTOM_MODEL = (
+    "weights/my_custom_ppe.pt"
+    if Path("weights/my_custom_ppe.pt").exists()
+    else "hf:Hansung-Cho/yolov8-ppe-detection:best.pt"
+)
 CSV_FIELDS = [
     "timestamp_utc", "camera", "track_id", "event_type", "crossing_direction",
     "helmet_status", "vest_status", "overall_status", "model", "evidence_image",
@@ -75,6 +81,8 @@ def classify_label(label: str) -> str:
         return "helmet_missing" if negative else "helmet_present"
     if vest_term:
         return "vest_missing" if negative else "vest_present"
+    if "borderline" in n or "border" in n:
+        return "borderline"
     return "other"
 
 
@@ -623,12 +631,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Webcam PPE monitoring POC. Not a certified safety system."
     )
-    parser.add_argument("--camera", default="0", help="Webcam index (0) or video path")
+    parser.add_argument("--camera", default="0", help="Webcam index (0) or IP camera RTSP/HTTP URL")
     parser.add_argument(
-        "--model", default=DEFAULT_HF_MODEL,
-        help=("YOLO model path/alias. Default is a third-party PPE-finetuned model; "
-              "use --model yolo11n.pt for general COCO weights (PPE then remains UNKNOWN)."),
+        "--model", default=DEFAULT_CUSTOM_MODEL,
+        help="YOLO model path/alias (default: self-trained weights/my_custom_ppe.pt if present)",
     )
+    parser.add_argument("--enhance-distant-workers", action="store_true", default=True,
+                        help="Enable high-resolution OpenCV crop analysis for workers far from CCTV cameras (default: True)")
     parser.add_argument("--conf", type=float, default=0.30, help="Detection confidence threshold")
     parser.add_argument("--person-conf", type=float, default=0.45,
                         help="Confidence threshold specifically for person detections (filters out background false positives, default: 0.45)")
@@ -677,19 +686,23 @@ def main() -> int:
     args = parse_args()
 
     if args.list_cameras:
-        print("\nScanning for connected video capture devices...")
-        cams = list_available_cameras()
-        if not cams:
-            print("No cameras detected. Ensure your external webcam is securely plugged in.")
-        else:
-            print(f"Found {len(cams)} video capture device(s):")
-            for idx, w, h in cams:
-                desc = "Primary / Built-in" if idx == 0 else "External Webcam"
-                res_str = f" ({w}x{h})" if (w and h) else ""
-                print(f"  --> Camera Index {idx}{res_str} - {desc}")
-            print("\nTo launch with a specific camera, pass --camera <index>, e.g.:")
-            print(f"  python ppe_webcam_poc.py --camera {cams[-1][0]} --model weights/my_custom_ppe.pt\n")
+        print("\n" + "=" * 68)
+        print(" [DYNAMIC CAMERA & CCTV STREAM DISCOVERY]")
+        print("=" * 68)
+        mgr = CameraManager()
+        cams = mgr.scan_cameras()
+        print(f"Total Cameras Configured / Detected: {len(cams)}\n")
+        for c in cams:
+            st = "[CONNECTED]    " if c["status"] == "CONNECTED" else "[NOT CONNECTED]"
+            res = f" ({c['resolution'][0]}x{c['resolution'][1]})" if c["resolution"][0] > 0 else ""
+            print(f"  {st:16} | [{c['type'].upper():4}] {c['name']}")
+            print(f"                   Endpoint: {c['source']}{res}")
+            if c.get("error_message"):
+                print(f"                   Reason  : {c['error_message']}")
+            print()
+        print("=" * 68)
         return 0
+
     if args.boundary_type == "dual_vertical":
         if not (0.05 <= args.zone_left < args.zone_right <= 0.95):
             print("ERROR: --zone-left must be less than --zone-right, and both between 0.05 and 0.95.", file=sys.stderr)
@@ -723,12 +736,12 @@ def main() -> int:
     if not role_summary["helmet_missing"] or not role_summary["vest_missing"]:
         print("WARNING: One or both explicit missing-PPE classes are absent. No detection is NOT proof of missing PPE; those item statuses will stay UNKNOWN.")
 
-    source = parse_source(args.camera)
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        print(f"ERROR: Could not open camera/video source {args.camera!r}. Close other camera apps or try --camera 1.", file=sys.stderr)
-        return 2
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # Initialize enterprise camera manager (supports IP RTSP/HTTP, USB, and auto-reconnect)
+    cam_mgr = CameraManager()
+    custom_src = args.camera if (args.camera != "0" or not cam_mgr.cameras) else None
+    stream = cam_mgr.get_active_stream(custom_source=custom_src)
+    camera_label = stream.config.name
+    print(f"Active Camera Stream: {camera_label} ({stream.config.source})")
 
     logger = EventLogger(Path(args.events), snapshots=args.save_snapshots, snapshot_dir=Path(args.snapshot_dir))
     track_states: Dict[int, TrackState] = {}
@@ -861,10 +874,21 @@ def main() -> int:
 
     try:
         while True:
-            ok, frame = cap.read()
+            ok, frame = stream.read()
             if not ok or frame is None:
-                print("Camera/video frame unavailable; stopping the POC loop.", file=sys.stderr)
-                break
+                # Camera is disconnected / offline!
+                # stream.read() provides the animated "CAMERA NOT CONNECTED" screen
+                if frame is not None:
+                    cv2.imshow(window_name, frame)
+                key = cv2.waitKey(30) & 0xFF
+                if key in (ord("q"), 27):
+                    break
+                elif key in (ord("c"), ord("C")):
+                    cam_mgr.cycle_next_camera()
+                    stream = cam_mgr.get_active_stream()
+                    camera_label = stream.config.name
+                continue
+
             if args.mirror:
                 frame = cv2.flip(frame, 1)
             frame_h, frame_w = frame.shape[:2]
@@ -908,6 +932,46 @@ def main() -> int:
             # Filter person detections using dedicated person confidence threshold to eliminate false positives
             people = [d for d in detections if d.role == "person" and d.confidence >= args.person_conf]
             associated = associate_ppe(people, detections)
+
+            # High-Resolution Crop Enhancement for Distant Workers (Wide CCTV feeds)
+            if getattr(args, "enhance_distant_workers", True):
+                for p_idx, person in enumerate(people):
+                    ev = associated.get(p_idx, {"helmet": [], "vest": []})
+                    px1, py1, px2, py2 = [int(v) for v in person.xyxy]
+                    pw = max(1, px2 - px1)
+                    ph = max(1, py2 - py1)
+                    # Far-away workers typically have small height in wide CCTV (45 to 300px)
+                    if 45 <= ph <= 300 and (not ev["helmet"] or not ev["vest"]):
+                        pad_x = int(pw * 0.15)
+                        pad_y = int(ph * 0.10)
+                        cx1 = max(0, px1 - pad_x)
+                        cy1 = max(0, py1 - pad_y)
+                        cx2 = min(frame_w, px2 + pad_x)
+                        cy2 = min(frame_h, py2 + pad_y)
+                        crop = frame[cy1:cy2, cx1:cx2]
+                        if crop.shape[0] > 30 and crop.shape[1] > 30:
+                            try:
+                                crop_res = model(crop, conf=max(0.18, args.conf * 0.75), imgsz=320, verbose=False)
+                                if crop_res and crop_res[0].boxes is not None and len(crop_res[0].boxes) > 0:
+                                    c_boxes = crop_res[0].boxes
+                                    c_xyxys = c_boxes.xyxy.cpu().numpy()
+                                    c_cls = c_boxes.cls.cpu().numpy().astype(int)
+                                    c_confs = c_boxes.conf.cpu().numpy()
+                                    for c_xy, c_cl, c_cf in zip(c_xyxys, c_cls, c_confs):
+                                        c_label = names.get(int(c_cl), f"class_{c_cl}")
+                                        c_role = classify_label(c_label)
+                                        if c_role in ("helmet_present", "helmet_missing", "vest_present", "vest_missing"):
+                                            abs_box = (
+                                                float(cx1 + c_xy[0]), float(cy1 + c_xy[1]),
+                                                float(cx1 + c_xy[2]), float(cy1 + c_xy[3]),
+                                            )
+                                            detections.append(Detection(
+                                                xyxy=abs_box, label=c_label, confidence=float(c_cf),
+                                                role=c_role, track_id=person.track_id,
+                                            ))
+                            except Exception:
+                                pass
+                associated = associate_ppe(people, detections)
             visible_track_ids = set()
             crossing_texts: List[str] = []
 
@@ -1228,6 +1292,12 @@ def main() -> int:
                 boundary_state["line_position"] = float(args.line_position)
                 boundary_state["status_notice"] = "RESET TO DEFAULTS"
                 boundary_state["status_notice_time"] = now
+            elif key in (ord("c"), ord("C")):
+                next_id = cam_mgr.cycle_next_camera()
+                stream = cam_mgr.get_active_stream()
+                camera_label = stream.config.name
+                boundary_state["status_notice"] = f"SWITCHED TO: {stream.config.name[:25]}"
+                boundary_state["status_notice_time"] = now
             elif key in (ord("e"), ord("E")):
                 ui_state["show_events_drawer"] = not ui_state["show_events_drawer"]
             elif key in (ord("d"), ord("D")):
@@ -1238,7 +1308,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("Interrupted by user.")
     finally:
-        cap.release()
+        stream.stop()
         cv2.destroyAllWindows()
         print(f"Event log: {Path(args.events).resolve()}")
         if args.save_snapshots:

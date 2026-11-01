@@ -1,0 +1,65 @@
+{
+  "active_camera_id": "cctv_entrance",
+  "cameras": [
+    {
+      "id": "usb_0",
+      "name": "Local Safety Webcam",
+      "type": "usb",
+      "source": "0",
+      "location": "Control Room / Safety Desk",
+      "enabled": true,
+      "reconnect_interval_sec": 3.0,
+      "description": "Primary USB video capture device",
+      "status": "RECONNECTING",
+      "last_seen": 1793523376.9817147,
+      "fps": 29.5,
+      "resolution": [
+        1280,
+        720
+      ],
+      "consecutive_failures": 0,
+      "error_message": "",
+      "last_seen_str": "2026-11-01 14:26:16"
+    },
+    {
+      "id": "cctv_entrance",
+      "name": "Dedicated IP CCTV (RTSP)",
+      "type": "ip",
+      "source": "rtsp://admin:pass@192.168.1.100:554/live",
+      "location": "Main Entrance / Gate 1",
+      "enabled": true,
+      "reconnect_interval_sec": 4.0,
+      "description": "Dedicated IP Camera with RTSP network stream",
+      "status": "RECONNECTING",
+      "last_seen": 0.0,
+      "fps": 0.0,
+      "resolution": [
+        0,
+        0
+      ],
+      "consecutive_failures": 0,
+      "error_message": "Host 192.168.1.100:554 unreachable (ping failed)",
+      "last_seen_str": "Never"
+    },
+    {
+      "id": "usb_1",
+      "name": "Discovered USB Webcam 1",
+      "type": "usb",
+      "source": "1",
+      "location": "Local Port",
+      "enabled": true,
+      "reconnect_interval_sec": 3.0,
+      "description": "",
+      "status": "CONNECTED",
+      "last_seen": 1793523385.524298,
+      "fps": 26.2,
+      "resolution": [
+        1280,
+        720
+      ],
+      "consecutive_failures": 0,
+      "error_message": "",
+      "last_seen_str": "2026-11-01 14:26:25"
+    }
+  ]
+}
