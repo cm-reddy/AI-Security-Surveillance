@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import socket
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -76,6 +77,8 @@ def probe_source(source_str: str, timeout: float = 2.0) -> Tuple[bool, str, Tupl
     if source_str.isdigit():
         idx = int(source_str)
         cap = cv2.VideoCapture(idx)
+        if not cap.isOpened() and sys.platform == "win32":
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
         if cap.isOpened():
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
@@ -312,6 +315,8 @@ class ResilientCameraStream:
         """Start the background ingestion thread."""
         if self.running:
             return
+        # Eagerly attempt initial connection so frame 1 is immediately available
+        self._try_open()
         self.running = True
         self.thread = threading.Thread(target=self._worker_loop, daemon=True, name=f"CamThread-{self.config.id}")
         self.thread.start()
@@ -353,11 +358,15 @@ class ResilientCameraStream:
             )
 
         try:
-            cap = cv2.VideoCapture(actual_source)
             if isinstance(actual_source, int):
-                # Request 1280x720 from USB webcam
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
+                cap = cv2.VideoCapture(actual_source)
+                if not cap.isOpened() and sys.platform == "win32":
+                    cap = cv2.VideoCapture(actual_source, cv2.CAP_DSHOW)
+                if cap.isOpened():
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
+            else:
+                cap = cv2.VideoCapture(actual_source)
 
             if cap.isOpened():
                 ok, test_frame = cap.read()

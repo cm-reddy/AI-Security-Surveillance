@@ -738,7 +738,7 @@ def main() -> int:
 
     # Initialize enterprise camera manager (supports IP RTSP/HTTP, USB, and auto-reconnect)
     cam_mgr = CameraManager()
-    custom_src = args.camera if (args.camera != "0" or not cam_mgr.cameras) else None
+    custom_src = str(args.camera) if args.camera is not None else None
     stream = cam_mgr.get_active_stream(custom_source=custom_src)
     camera_label = stream.config.name
     print(f"Active Camera Stream: {camera_label} ({stream.config.source})")

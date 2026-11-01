@@ -1,5 +1,5 @@
 {
-  "active_camera_id": "cctv_entrance",
+  "active_camera_id": "usb_0",
   "cameras": [
     {
       "id": "usb_0",
