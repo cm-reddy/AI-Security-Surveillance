@@ -10,16 +10,16 @@
       "enabled": true,
       "reconnect_interval_sec": 3.0,
       "description": "Primary USB video capture device",
-      "status": "RECONNECTING",
-      "last_seen": 1793523376.9817147,
-      "fps": 29.5,
+      "status": "CONNECTED",
+      "last_seen": 1793543832.5328794,
+      "fps": 0.0,
       "resolution": [
-        1280,
-        720
+        640,
+        480
       ],
       "consecutive_failures": 0,
       "error_message": "",
-      "last_seen_str": "2026-11-01 14:26:16"
+      "last_seen_str": "2026-11-01 20:07:12"
     },
     {
       "id": "cctv_entrance",
@@ -30,7 +30,7 @@
       "enabled": true,
       "reconnect_interval_sec": 4.0,
       "description": "Dedicated IP Camera with RTSP network stream",
-      "status": "RECONNECTING",
+      "status": "NOT_CONNECTED",
       "last_seen": 0.0,
       "fps": 0.0,
       "resolution": [
@@ -51,15 +51,15 @@
       "reconnect_interval_sec": 3.0,
       "description": "",
       "status": "CONNECTED",
-      "last_seen": 1793523385.524298,
-      "fps": 26.2,
+      "last_seen": 1793543833.731077,
+      "fps": 0.0,
       "resolution": [
         1280,
         720
       ],
       "consecutive_failures": 0,
       "error_message": "",
-      "last_seen_str": "2026-11-01 14:26:25"
+      "last_seen_str": "2026-11-01 20:07:13"
     }
   ]
 }

@@ -136,7 +136,7 @@ python ppe_webcam_poc.py --list-cameras
 ```
 
 ### 2. Start Live Monitoring (Default Camera)
-Launches the primary stream configured in `cameras.json` using the self-trained model:
+Launches the primary stream configured in `cameras.json` (defaults directly to the laptop's built-in webcam `usb_0`):
 ```bash
 python ppe_webcam_poc.py
 ```
@@ -148,9 +148,12 @@ python ppe_webcam_poc.py --camera "rtsp://admin:password@192.168.1.100:554/live"
 ```
 
 ### 4. Connect to a Specific USB Webcam Index
+To explicitly target a specific local USB camera index:
 ```bash
-python ppe_webcam_poc.py --camera 1
+python ppe_webcam_poc.py --camera 0   # Built-in laptop webcam
+python ppe_webcam_poc.py --camera 1   # External USB webcam
 ```
+*(Note: Ensure you use the singular flag `--camera`, not `--cameras`).*
 
 ### 5. Launch the Web Command Center Dashboard
 In a separate terminal, start the local monitoring dashboard:
