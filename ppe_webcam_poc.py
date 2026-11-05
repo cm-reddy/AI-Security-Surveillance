@@ -2,7 +2,8 @@
 """Webcam PPE monitoring proof of concept.
 
 This is a demonstration/monitoring aid, not a safety-rated access-control system.
-It intentionally returns UNKNOWN when PPE evidence is missing or conflicting.
+It uses a Zero-Trust safety model: workers are COMPLIANT only when both helmet
+and vest are verified PRESENT. All other cases are NON_COMPLIANT.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import io
 import math
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -23,11 +25,15 @@ from pathlib import Path
 from typing import Deque, Dict, List, Optional, Sequence, Tuple
 import webbrowser
 
+# Suppress low-level OpenCV C++ stderr logs
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
+
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from camera_manager import CameraManager, probe_source
+from camera_manager import CameraManager, probe_source, fast_tcp_ping
 
 try:
     import winsound  # Windows only
@@ -102,8 +108,48 @@ class TrackState:
     last_zone_state: Optional[str] = None
     last_crossing_at: float = 0.0
     last_violation_logged_at: float = 0.0
+    last_compliant_logged_at: float = 0.0
+    compliant_logged: bool = False
+    last_box: Optional[Tuple[float, float, float, float]] = None
     helmet_history: Deque[str] = field(default_factory=lambda: deque(maxlen=8))
     vest_history: Deque[str] = field(default_factory=lambda: deque(maxlen=8))
+
+
+def box_iou(boxA: Tuple[float, float, float, float], boxB: Tuple[float, float, float, float]) -> float:
+    """Compute Intersection-over-Union between two boxes for track continuity."""
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    inter = max(0.0, xB - xA) * max(0.0, yB - yA)
+    areaA = max(1.0, (boxA[2] - boxA[0]) * (boxA[3] - boxA[1]))
+    areaB = max(1.0, (boxB[2] - boxB[0]) * (boxB[3] - boxB[1]))
+    return inter / float(areaA + areaB - inter)
+
+
+def launch_dashboard(port: int = 8080) -> bool:
+    """Ensure dashboard HTTP server is alive; auto-launch background process if needed, then open browser."""
+    url = f"http://localhost:{port}"
+    alive = fast_tcp_ping("127.0.0.1", port, timeout=0.4)
+    if not alive:
+        dash_script = Path(__file__).parent / "dashboard.py"
+        if dash_script.exists():
+            try:
+                subprocess.Popen(
+                    [sys.executable, str(dash_script), "--port", str(port)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                time.sleep(0.6)
+            except Exception as e:
+                print(f"Could not auto-start dashboard: {e}", file=sys.stderr)
+    try:
+        webbrowser.open(url)
+        return True
+    except Exception as e:
+        print(f"Failed to open browser: {e}", file=sys.stderr)
+        return False
 
 
 def load_model(model_arg: str, world_classes: Optional[Sequence[str]] = None) -> Tuple[Any, str]:
@@ -256,11 +302,13 @@ def smooth_status(history: Deque[str], min_votes: int = 3) -> str:
 
 
 def overall_status(helmet_status: str, vest_status: str) -> str:
-    if helmet_status == MISSING or vest_status == MISSING:
-        return NON_COMPLIANT
+    """Zero-Trust Safety Rule: Worker is COMPLIANT only when BOTH helmet and vest are verified PRESENT.
+    
+    If either item is missing, unverified, or unknown, the worker is NON_COMPLIANT.
+    """
     if helmet_status == PRESENT and vest_status == PRESENT:
         return COMPLIANT
-    return UNKNOWN
+    return NON_COMPLIANT
 
 
 def person_anchor(person_box: Tuple[float, float, float, float], anchor: str) -> Tuple[int, int]:
@@ -524,8 +572,8 @@ def draw_badge(
 
 
 def draw_events_drawer(
-    frame, recent_events: Sequence[Dict[str, Any]], frame_w: int, frame_h: int, hover_close: bool = False
-) -> Tuple[int, int, int, int]:
+    frame, recent_events: Sequence[Dict[str, Any]], frame_w: int, frame_h: int, hover_close: bool = False, hover_dash: bool = False
+) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]:
     """Draw a semi-transparent dark HUD drawer displaying recent events on the right side."""
     drawer_w = min(420, max(320, int(frame_w * 0.40)))
     dx1 = frame_w - drawer_w
@@ -533,7 +581,7 @@ def draw_events_drawer(
     dx2 = frame_w - 6
     dy2 = frame_h - 12
     if dx2 <= dx1 or dy2 <= dy1:
-        return (0, 0, 0, 0)
+        return (0, 0, 0, 0), (0, 0, 0, 0)
 
     # Semi-transparent dark overlay background (alpha 0.88)
     sub = frame[dy1:dy2, dx1:dx2]
@@ -555,55 +603,66 @@ def draw_events_drawer(
     cv2.rectangle(frame, (close_btn_rect[0], close_btn_rect[1]), (close_btn_rect[2], close_btn_rect[3]), (200, 200, 200), 1, cv2.LINE_AA)
     cv2.putText(frame, "X", (close_btn_rect[0] + 7, close_btn_rect[1] + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
+    # Dashboard Button in modal footer
+    dash_btn_y1 = dy2 - 46
+    dash_btn_y2 = dy2 - 14
+    modal_dash_rect = (dx1 + 12, dash_btn_y1, dx2 - 12, dash_btn_y2)
+
     # Render events (most recent first)
-    events_list = list(reversed(recent_events))[:6]
+    events_list = list(reversed(recent_events))[:5]
     cur_y = dy1 + 46
 
     if not events_list:
         cv2.putText(frame, "No events recorded yet.", (dx1 + 16, cur_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 150), 1, cv2.LINE_AA)
         cv2.putText(frame, "Walk into the Machine Zone", (dx1 + 16, cur_y + 46), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 120, 120), 1, cv2.LINE_AA)
         cv2.putText(frame, "to trigger an alarm & audit event.", (dx1 + 16, cur_y + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 120, 120), 1, cv2.LINE_AA)
-        return close_btn_rect
+    else:
+        for ev in events_list:
+            if cur_y + 60 > (dash_btn_y1 - 25):
+                break
+            card_h = 56
+            status = ev.get("overall_status", "")
+            event_type = ev.get("event_type", "")
+            track_id = ev.get("track_id", "?")
+            t_str = ev.get("timestamp_utc", "")
+            if "T" in t_str:
+                time_part = t_str.split("T")[1][:8]
+            else:
+                time_part = t_str[-8:] if len(t_str) >= 8 else t_str
 
-    for ev in events_list:
-        if cur_y + 60 > dy2:
-            break
-        card_h = 56
-        status = ev.get("overall_status", "")
-        event_type = ev.get("event_type", "")
-        track_id = ev.get("track_id", "?")
-        t_str = ev.get("timestamp_utc", "")
-        if "T" in t_str:
-            time_part = t_str.split("T")[1][:8]
-        else:
-            time_part = t_str[-8:] if len(t_str) >= 8 else t_str
+            is_violation = ("NONCOMPLIANT" in event_type or status == "NON_COMPLIANT" or "UNKNOWN" in event_type)
+            tag_color = (0, 0, 220) if is_violation else (0, 180, 0)
+            tag_label = "BREACH" if is_violation else "COMPLIANT"
 
-        is_violation = ("NONCOMPLIANT" in event_type or status == "NON_COMPLIANT")
-        is_compliant = ("COMPLIANT" in event_type and not is_violation)
-        tag_color = (0, 0, 220) if is_violation else ((0, 180, 0) if is_compliant else (0, 165, 255))
-        tag_label = "BREACH" if is_violation else ("COMPLIANT" if is_compliant else "UNKNOWN")
+            # Container card
+            cv2.rectangle(frame, (dx1 + 8, cur_y), (dx2 - 8, cur_y + card_h), (25, 25, 30), -1)
+            cv2.rectangle(frame, (dx1 + 8, cur_y), (dx2 - 8, cur_y + card_h), (50, 50, 60), 1)
+            # Status strip
+            cv2.rectangle(frame, (dx1 + 8, cur_y), (dx1 + 12, cur_y + card_h), tag_color, -1)
 
-        # Container card
-        cv2.rectangle(frame, (dx1 + 8, cur_y), (dx2 - 8, cur_y + card_h), (25, 25, 30), -1)
-        cv2.rectangle(frame, (dx1 + 8, cur_y), (dx2 - 8, cur_y + card_h), (50, 50, 60), 1)
-        # Status strip
-        cv2.rectangle(frame, (dx1 + 8, cur_y), (dx1 + 12, cur_y + card_h), tag_color, -1)
+            draw_badge(frame, tag_label, dx1 + 18, cur_y + 18, tag_color, (255, 255, 255), scale=0.34, thickness=1)
+            header_text = f"Worker #{track_id} | {time_part} UTC"
+            cv2.putText(frame, header_text, (dx1 + 92, cur_y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1, cv2.LINE_AA)
 
-        draw_badge(frame, tag_label, dx1 + 18, cur_y + 18, tag_color, (255, 255, 255), scale=0.34, thickness=1)
-        header_text = f"Worker #{track_id} | {time_part} UTC"
-        cv2.putText(frame, header_text, (dx1 + 92, cur_y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1, cv2.LINE_AA)
+            h_st = ev.get("helmet_status", "?")
+            v_st = ev.get("vest_status", "?")
+            loc = ev.get("crossing_direction", "zone")
+            detail_str = f"H: {h_st[:4]} | V: {v_st[:4]} | {loc}"
+            cv2.putText(frame, detail_str, (dx1 + 18, cur_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (170, 170, 170), 1, cv2.LINE_AA)
 
-        h_st = ev.get("helmet_status", "?")
-        v_st = ev.get("vest_status", "?")
-        loc = ev.get("crossing_direction", "zone")
-        detail_str = f"H: {h_st[:4]} | V: {v_st[:4]} | {loc}"
-        cv2.putText(frame, detail_str, (dx1 + 18, cur_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (170, 170, 170), 1, cv2.LINE_AA)
+            cur_y += card_h + 6
 
-        cur_y += card_h + 6
+    # Draw modal web dashboard button
+    mb_bg = (0, 180, 120) if hover_dash else (30, 55, 45)
+    mb_border = (0, 240, 160) if hover_dash else (0, 160, 100)
+    cv2.rectangle(frame, (modal_dash_rect[0], modal_dash_rect[1]), (modal_dash_rect[2], modal_dash_rect[3]), mb_bg, -1)
+    cv2.rectangle(frame, (modal_dash_rect[0], modal_dash_rect[1]), (modal_dash_rect[2], modal_dash_rect[3]), mb_border, 1, cv2.LINE_AA)
+    cv2.putText(frame, "OPEN WEB DASHBOARD (http://localhost:8080)", (modal_dash_rect[0] + 12, dash_btn_y1 + 21),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
 
     footer_text = "Press 'E' or click [X] to close"
-    cv2.putText(frame, footer_text, (dx1 + 12, dy2 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 120, 120), 1, cv2.LINE_AA)
-    return close_btn_rect
+    cv2.putText(frame, footer_text, (dx1 + 14, dy2 - 54), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (120, 120, 120), 1, cv2.LINE_AA)
+    return close_btn_rect, modal_dash_rect
 
 
 def parse_source(value: str):
@@ -782,6 +841,7 @@ def main() -> int:
         "events_btn_rect": (0, 0, 0, 0),
         "dash_btn_rect": (0, 0, 0, 0),
         "close_btn_rect": (0, 0, 0, 0),
+        "modal_dash_btn_rect": (0, 0, 0, 0),
         "hover_btn": None,
     }
 
@@ -800,6 +860,8 @@ def main() -> int:
                 ui_state["hover_btn"] = "events"
             elif in_rect(*ui_state["dash_btn_rect"]):
                 ui_state["hover_btn"] = "dashboard"
+            elif ui_state["show_events_drawer"] and in_rect(*ui_state["modal_dash_btn_rect"]):
+                ui_state["hover_btn"] = "modal_dash"
             elif ui_state["show_events_drawer"] and in_rect(*ui_state["close_btn_rect"]):
                 ui_state["hover_btn"] = "close"
             else:
@@ -811,15 +873,23 @@ def main() -> int:
                 ui_state["show_events_drawer"] = not ui_state["show_events_drawer"]
                 return
             elif in_rect(*ui_state["dash_btn_rect"]):
-                webbrowser.open("http://localhost:8080")
-                boundary_state["status_notice"] = "OPENING DASHBOARD (http://localhost:8080)..."
+                launch_dashboard()
+                boundary_state["status_notice"] = "DASHBOARD OPENED: http://localhost:8080"
+                boundary_state["status_notice_time"] = time.monotonic()
+                return
+            elif ui_state["show_events_drawer"] and in_rect(*ui_state["modal_dash_btn_rect"]):
+                launch_dashboard()
+                boundary_state["status_notice"] = "DASHBOARD OPENED: http://localhost:8080"
                 boundary_state["status_notice_time"] = time.monotonic()
                 return
             elif ui_state["show_events_drawer"] and in_rect(*ui_state["close_btn_rect"]):
                 ui_state["show_events_drawer"] = False
                 return
             elif ui_state["show_events_drawer"] and x >= (fw - 420):
-                # Click inside drawer: consume event so borders don't drag
+                # Click inside drawer / event cards: launch web dashboard
+                launch_dashboard()
+                boundary_state["status_notice"] = "DASHBOARD OPENED: http://localhost:8080"
+                boundary_state["status_notice_time"] = time.monotonic()
                 return
 
         b_type = boundary_state["boundary_type"]
@@ -929,8 +999,14 @@ def main() -> int:
                         classify_label(label), int(track_id) if track_id is not None else None,
                     ))
 
-            # Filter person detections using dedicated person confidence threshold to eliminate false positives
-            people = [d for d in detections if d.role == "person" and d.confidence >= args.person_conf]
+            # Filter person detections: allow slightly lower threshold for far/small workers to prevent dropouts
+            people = [
+                d for d in detections
+                if d.role == "person" and (
+                    d.confidence >= args.person_conf or
+                    (d.confidence >= max(0.22, args.person_conf * 0.65) and (d.xyxy[3] - d.xyxy[1]) <= 320)
+                )
+            ]
             associated = associate_ppe(people, detections)
 
             # High-Resolution Crop Enhancement for Distant Workers (Wide CCTV feeds)
@@ -940,18 +1016,28 @@ def main() -> int:
                     px1, py1, px2, py2 = [int(v) for v in person.xyxy]
                     pw = max(1, px2 - px1)
                     ph = max(1, py2 - py1)
-                    # Far-away workers typically have small height in wide CCTV (45 to 300px)
-                    if 45 <= ph <= 300 and (not ev["helmet"] or not ev["vest"]):
-                        pad_x = int(pw * 0.15)
-                        pad_y = int(ph * 0.10)
+                    # Far-away or missing-PPE workers: upscale small crops using OpenCV interpolation
+                    # so distant small helmets and vests are sharp and magnified for YOLO
+                    if ph >= 35 and (not ev["helmet"] or not ev["vest"]):
+                        pad_x = int(pw * 0.20)
+                        pad_y = int(ph * 0.15)
                         cx1 = max(0, px1 - pad_x)
                         cy1 = max(0, py1 - pad_y)
                         cx2 = min(frame_w, px2 + pad_x)
                         cy2 = min(frame_h, py2 + pad_y)
                         crop = frame[cy1:cy2, cx1:cx2]
-                        if crop.shape[0] > 30 and crop.shape[1] > 30:
+                        if crop.shape[0] > 25 and crop.shape[1] > 25:
                             try:
-                                crop_res = model(crop, conf=max(0.18, args.conf * 0.75), imgsz=320, verbose=False)
+                                ch, cw = crop.shape[:2]
+                                if max(ch, cw) < 320:
+                                    scale = 320.0 / max(ch, cw)
+                                    proc_w, proc_h = int(cw * scale), int(ch * scale)
+                                    crop_proc = cv2.resize(crop, (proc_w, proc_h), interpolation=cv2.INTER_CUBIC)
+                                else:
+                                    scale = 1.0
+                                    crop_proc = crop
+
+                                crop_res = model(crop_proc, conf=max(0.15, args.conf * 0.65), imgsz=320, verbose=False)
                                 if crop_res and crop_res[0].boxes is not None and len(crop_res[0].boxes) > 0:
                                     c_boxes = crop_res[0].boxes
                                     c_xyxys = c_boxes.xyxy.cpu().numpy()
@@ -962,8 +1048,8 @@ def main() -> int:
                                         c_role = classify_label(c_label)
                                         if c_role in ("helmet_present", "helmet_missing", "vest_present", "vest_missing"):
                                             abs_box = (
-                                                float(cx1 + c_xy[0]), float(cy1 + c_xy[1]),
-                                                float(cx1 + c_xy[2]), float(cy1 + c_xy[3]),
+                                                float(cx1 + c_xy[0] / scale), float(cy1 + c_xy[1] / scale),
+                                                float(cx1 + c_xy[2] / scale), float(cy1 + c_xy[3] / scale),
                                             )
                                             detections.append(Detection(
                                                 xyxy=abs_box, label=c_label, confidence=float(c_cf),
@@ -981,6 +1067,24 @@ def main() -> int:
 
             for idx, person in enumerate(people):
                 person_track_id = person.track_id
+
+                # Spatial Proximity Fallback for Distant Tracks (prevents dropped track IDs & history loss)
+                if person_track_id is None or person_track_id not in track_states:
+                    best_iou, match_tid = 0.0, None
+                    for tid, st in track_states.items():
+                        if (now - st.last_seen) <= 1.8 and st.last_box is not None:
+                            iou = box_iou(person.xyxy, st.last_box)
+                            if iou > 0.30 and iou > best_iou:
+                                best_iou = iou
+                                match_tid = tid
+                    if match_tid is not None:
+                        if person_track_id is None:
+                            person_track_id = match_tid
+                            person.track_id = match_tid
+                        else:
+                            # Transfer accumulated PPE evidence to the new track ID
+                            track_states[person_track_id] = track_states[match_tid]
+
                 if person_track_id is None:
                     x1, y1, x2, y2 = (int(v) for v in person.xyxy)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 215, 255), 1)
@@ -997,6 +1101,7 @@ def main() -> int:
                     )
                     track_states[person_track_id] = state
                 state.last_seen = now
+                state.last_box = person.xyxy
 
                 frame_evidence = associated.get(idx, {"helmet": [], "vest": []})
                 state.helmet_history.append(frame_item_status(frame_evidence["helmet"]))
@@ -1005,9 +1110,9 @@ def main() -> int:
                 vest_status = smooth_status(state.vest_history, min_votes=args.min_votes)
                 overall = overall_status(helmet_status, vest_status)
 
-                color = (0, 190, 0) if overall == COMPLIANT else ((0, 0, 255) if overall == NON_COMPLIANT else (0, 215, 255))
+                color = (0, 190, 0) if overall == COMPLIANT else (0, 0, 255)
                 x1, y1, x2, y2 = (int(v) for v in person.xyxy)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2 if overall != NON_COMPLIANT else 3)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2 if overall == COMPLIANT else 3)
 
                 anchor_point = person_anchor(person.xyxy, args.anchor)
 
@@ -1030,18 +1135,19 @@ def main() -> int:
                 detail_text = f"Helmet: {helmet_status} | Vest: {vest_status}"
                 draw_badge(frame, detail_text, x1, min(frame_h - 10, y2 + 20), (35, 35, 35), (230, 230, 230), scale=0.38, thickness=1)
 
-                # Active Machine Zone Monitoring & Presence Violation Logging
-                if args.auto_log_violations and overall == NON_COMPLIANT:
-                    in_danger_zone = (boundary_state["boundary_type"] != "dual_vertical") or (cur_zone == "MACHINE_ZONE")
-                    if in_danger_zone:
+                # Active Machine Zone Monitoring & Presence Violation / Compliance Logging
+                in_danger_zone = (boundary_state["boundary_type"] != "dual_vertical") or (cur_zone == "MACHINE_ZONE")
+                if in_danger_zone:
+                    if overall == NON_COMPLIANT:
                         # Loud audible alarm fires immediately & repeatedly while in danger zone
                         if not args.no_audio and (now - last_beep) >= args.beep_cooldown:
                             play_warning_beep()
                             last_beep = now
 
                         # Rate-limit CSV logging so events.csv doesn't get flooded every frame
-                        if (now - state.last_violation_logged_at) >= args.violation_interval:
+                        if args.auto_log_violations and (now - state.last_violation_logged_at) >= args.violation_interval:
                             state.last_violation_logged_at = now
+                            state.compliant_logged = False
                             event_type = "PPE_NONCOMPLIANT_CROSSING"
                             loc_desc = "machine_zone" if (boundary_state["boundary_type"] == "dual_vertical" and cur_zone == "MACHINE_ZONE") else "camera_view"
                             logger.log(camera_label, person_track_id, event_type, loc_desc,
@@ -1050,6 +1156,18 @@ def main() -> int:
                             last_violation_time = now
                             last_violation_msg = f"WORKER #{person_track_id} IN MACHINE ZONE WITHOUT PPE"
                             print(f"[ALERT] Logged PPE violation for Worker #{person_track_id} ({loc_desc}) to {args.events}")
+                    elif overall == COMPLIANT:
+                        # Worker is fully compliant in machine zone / camera view
+                        # Log compliant verification when first verified or periodically
+                        if not state.compliant_logged or (now - state.last_compliant_logged_at) >= max(30.0, args.violation_interval * 3):
+                            state.compliant_logged = True
+                            state.last_compliant_logged_at = now
+                            event_type = "PPE_COMPLIANT_CROSSING"
+                            loc_desc = "machine_zone" if (boundary_state["boundary_type"] == "dual_vertical" and cur_zone == "MACHINE_ZONE") else "camera_view"
+                            logger.log(camera_label, person_track_id, event_type, loc_desc,
+                                       helmet_status, vest_status, model_label, frame)
+                            crossing_texts.append(f"ID #{person_track_id}: COMPLIANT VERIFIED")
+                            print(f"[COMPLIANT] Logged verified PPE for Worker #{person_track_id} ({loc_desc}) to {args.events}")
 
                 # Boundary crossing detection (dual vertical machine borders or single entry line)
                 if boundary_state["boundary_type"] == "dual_vertical":
@@ -1063,25 +1181,26 @@ def main() -> int:
                                 direction = "entry_from_left" if prev_zone == "LEFT_WALKWAY" else "entry_from_right"
                                 if (now - state.last_crossing_at) >= 0.25:
                                     state.last_crossing_at = now
-                                    if overall == NON_COMPLIANT:
+                                    if overall == COMPLIANT:
+                                        event_type = "PPE_COMPLIANT_CROSSING"
+                                        state.compliant_logged = True
+                                        state.last_compliant_logged_at = now
+                                    else:
                                         event_type = "PPE_NONCOMPLIANT_CROSSING"
                                         last_violation_time = now
                                         last_violation_msg = f"WORKER #{person_track_id} BREACHED MACHINE CELL ({direction.upper()})"
-                                    elif overall == UNKNOWN:
-                                        event_type = "PPE_UNKNOWN_AT_CROSSING"
-                                        last_violation_time = now
-                                        last_violation_msg = f"WORKER #{person_track_id} ENTERED MACHINE CELL (UNVERIFIED)"
-                                    else:
-                                        event_type = "PPE_COMPLIANT_CROSSING"
+                                        state.compliant_logged = False
+                                        state.last_violation_logged_at = now
+                                        if not args.no_audio and (now - last_beep) >= args.beep_cooldown:
+                                            play_warning_beep()
+                                            last_beep = now
                                     logger.log(camera_label, person_track_id, event_type, direction,
                                                helmet_status, vest_status, model_label, frame)
                                     crossing_texts.append(f"ID #{person_track_id}: {direction} -> {event_type}")
                                     print(f"[ZONE ENTRY] Worker #{person_track_id} crossed yellow border into Machine Zone ({direction}) -> {event_type}")
-                                    if overall != COMPLIANT and not args.no_audio and (now - last_beep) >= args.beep_cooldown:
-                                        play_warning_beep()
-                                        last_beep = now
                             elif prev_zone == "MACHINE_ZONE" and zone in ("LEFT_WALKWAY", "RIGHT_WALKWAY"):
                                 crossing_texts.append(f"ID #{person_track_id}: EXITED TO WALKWAY")
+                                state.compliant_logged = False
                         state.last_zone_state = zone
                 else:
                     side = point_side(anchor_point, frame_w, frame_h, boundary_state["line_orientation"],
@@ -1093,22 +1212,22 @@ def main() -> int:
                             is_entry_crossing = direction == args.entry_direction
                             if is_entry_crossing and (now - state.last_crossing_at) >= 0.25:
                                 state.last_crossing_at = now
-                                if overall == NON_COMPLIANT:
+                                if overall == COMPLIANT:
+                                    event_type = "PPE_COMPLIANT_CROSSING"
+                                    state.compliant_logged = True
+                                    state.last_compliant_logged_at = now
+                                else:
                                     event_type = "PPE_NONCOMPLIANT_CROSSING"
                                     last_violation_time = now
                                     last_violation_msg = f"WORKER #{person_track_id} - PPE NON-COMPLIANT"
-                                elif overall == UNKNOWN:
-                                    event_type = "PPE_UNKNOWN_AT_CROSSING"
-                                    last_violation_time = now
-                                    last_violation_msg = f"WORKER #{person_track_id} - PPE UNVERIFIED"
-                                else:
-                                    event_type = "PPE_COMPLIANT_CROSSING"
+                                    state.compliant_logged = False
+                                    state.last_violation_logged_at = now
+                                    if not args.no_audio and (now - last_beep) >= args.beep_cooldown:
+                                        play_warning_beep()
+                                        last_beep = now
                                 logger.log(camera_label, person_track_id, event_type, direction,
                                            helmet_status, vest_status, model_label, frame)
-                                crossing_texts.append(f"ID {person_track_id}: {event_type}")
-                                if overall != COMPLIANT and not args.no_audio and (now - last_beep) >= args.beep_cooldown:
-                                    play_warning_beep()
-                                    last_beep = now
+                                crossing_texts.append(f"ID #{person_track_id}: {event_type}")
                         state.last_stable_side = side
 
                 cv2.circle(frame, anchor_point, 5, color, -1)
@@ -1151,19 +1270,19 @@ def main() -> int:
                 hud_line2_left += f" | Machine: {boundary_state['zone_left']*100:.0f}%-{boundary_state['zone_right']*100:.0f}%"
             cv2.putText(frame, hud_line2_left, (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 220, 220), 1, cv2.LINE_AA)
 
-            # Draw Interactive Top-Right Buttons: [ 🌐 Dashboard (D) ] and [ 📋 Events (E) (N) ]
+            # Draw Interactive Top-Right Buttons: [ Dashboard (D) ] and [ Events (E) ]
             btn_y1 = 8
             btn_y2 = 44
 
             events_count = len(logger.recent_events)
-            events_text = f"📋 Events ({events_count})" if not ui_state["show_events_drawer"] else "📋 Events [X]"
+            events_text = f"Events ({events_count})" if not ui_state["show_events_drawer"] else "Events [X]"
             (etw, _), _ = cv2.getTextSize(events_text, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
             eb_w = etw + 22
             eb_x2 = frame_w - 12
             eb_x1 = eb_x2 - eb_w
             ui_state["events_btn_rect"] = (eb_x1, btn_y1, eb_x2, btn_y2)
 
-            dash_text = "🌐 Dashboard"
+            dash_text = "Dashboard (D)"
             (dtw, _), _ = cv2.getTextSize(dash_text, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
             db_w = dtw + 20
             db_x2 = eb_x1 - 10
@@ -1221,8 +1340,13 @@ def main() -> int:
 
             # Render Slide-Out Events Drawer if toggled open
             if ui_state["show_events_drawer"]:
-                ui_state["close_btn_rect"] = draw_events_drawer(
-                    frame, logger.recent_events, frame_w, frame_h, hover_close=(ui_state["hover_btn"] == "close")
+                ui_state["close_btn_rect"], ui_state["modal_dash_btn_rect"] = draw_events_drawer(
+                    frame,
+                    logger.recent_events,
+                    frame_w,
+                    frame_h,
+                    hover_close=(ui_state["hover_btn"] == "close"),
+                    hover_dash=(ui_state["hover_btn"] == "modal_dash"),
                 )
 
             cv2.imshow(window_name, frame)
@@ -1301,8 +1425,8 @@ def main() -> int:
             elif key in (ord("e"), ord("E")):
                 ui_state["show_events_drawer"] = not ui_state["show_events_drawer"]
             elif key in (ord("d"), ord("D")):
-                webbrowser.open("http://localhost:8080")
-                boundary_state["status_notice"] = "OPENING DASHBOARD..."
+                launch_dashboard()
+                boundary_state["status_notice"] = "DASHBOARD OPENED: http://localhost:8080"
                 boundary_state["status_notice_time"] = now
 
     except KeyboardInterrupt:

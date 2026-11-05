@@ -161,9 +161,9 @@ class TestStatusEvaluation(unittest.TestCase):
         self.assertEqual(overall_status(PRESENT, MISSING), NON_COMPLIANT)
         self.assertEqual(overall_status(MISSING, PRESENT), NON_COMPLIANT)
         self.assertEqual(overall_status(MISSING, MISSING), NON_COMPLIANT)
-        self.assertEqual(overall_status(PRESENT, UNKNOWN), UNKNOWN)
-        self.assertEqual(overall_status(UNKNOWN, PRESENT), UNKNOWN)
-        self.assertEqual(overall_status(UNKNOWN, UNKNOWN), UNKNOWN)
+        self.assertEqual(overall_status(PRESENT, UNKNOWN), NON_COMPLIANT)
+        self.assertEqual(overall_status(UNKNOWN, PRESENT), NON_COMPLIANT)
+        self.assertEqual(overall_status(UNKNOWN, UNKNOWN), NON_COMPLIANT)
 
 
 class TestCrossingDetection(unittest.TestCase):
@@ -207,7 +207,7 @@ class TestEventLoggerAndDashboard(unittest.TestCase):
 
             stats = compute_stats(events)
             self.assertEqual(stats["total_crossings"], 3)
-            self.assertEqual(stats["violations"], 1)
+            self.assertEqual(stats["violations"], 2)  # Non-compliant + Unknown counted as violations
             self.assertEqual(stats["compliant"], 1)
             self.assertEqual(stats["unknown"], 1)
             self.assertIn("0", stats["cameras"])

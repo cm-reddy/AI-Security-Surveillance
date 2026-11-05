@@ -25,8 +25,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+# Suppress noisy low-level OpenCV C++ stderr logs (e.g. obsensor, ffmpeg device probes)
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
+
 import cv2
 import numpy as np
+
+try:
+    import cv2.utils.logging as cvlog
+    cvlog.setLogLevel(cvlog.LOG_LEVEL_SILENT)
+except Exception:
+    pass
 
 logger = logging.getLogger("CameraManager")
 if not logger.handlers:
@@ -76,14 +86,30 @@ def probe_source(source_str: str, timeout: float = 2.0) -> Tuple[bool, str, Tupl
     # 1. Numeric USB camera index
     if source_str.isdigit():
         idx = int(source_str)
-        cap = cv2.VideoCapture(idx)
-        if not cap.isOpened() and sys.platform == "win32":
+        if sys.platform == "win32":
             cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(idx)
         if cap.isOpened():
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            # Auto-negotiate highest supported hardware resolution (1080p -> 720p -> 480p)
+            # This ensures different laptop screens and webcams report true native resolution
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            ok, test_frame = cap.read()
+            if not ok or test_frame is None:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                ok, test_frame = cap.read()
+            if not ok or test_frame is None:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                ok, test_frame = cap.read()
+            if ok and test_frame is not None:
+                h, w = test_frame.shape[:2]
+                cap.release()
+                return True, "USB device active", (w, h)
             cap.release()
-            return True, "USB device active", (w, h)
+            return False, f"USB camera index {idx} opened but failed to yield frame", (0, 0)
         return False, f"USB camera index {idx} not responding", (0, 0)
 
     # 2. Local video file
@@ -467,11 +493,13 @@ class CameraManager:
         self.cameras: Dict[str, CameraInfo] = {}
         self.active_camera_id: str = "usb_0"
         self.active_stream: Optional[ResilientCameraStream] = None
+        self._last_mtime: float = 0.0
         self._load_config()
 
     def _load_config(self):
         if self.config_path.exists():
             try:
+                self._last_mtime = os.path.getmtime(self.config_path)
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.active_camera_id = data.get("active_camera_id", "usb_0")
@@ -480,7 +508,7 @@ class CameraManager:
                         filtered = {k: v for k, v in c.items() if k in valid_keys}
                         cam = CameraInfo(**filtered)
                         self.cameras[cam.id] = cam
-                logger.info(f"Loaded {len(self.cameras)} cameras from {self.config_path}")
+                logger.debug(f"Loaded {len(self.cameras)} cameras from {self.config_path}")
                 return
             except Exception as e:
                 logger.error(f"Error reading {self.config_path}: {e}")
@@ -501,6 +529,19 @@ class CameraManager:
             self.cameras[c.id] = c
         self.save_config()
 
+    def load_config(self):
+        """Re-read cameras.json only if the file on disk has actually changed."""
+        if not self.config_path.exists():
+            return
+        try:
+            mtime = os.path.getmtime(self.config_path)
+            if mtime <= self._last_mtime and len(self.cameras) > 0:
+                return  # File unchanged, skip reload and avoid log spam
+            self.cameras.clear()
+            self._load_config()
+        except Exception:
+            pass
+
     def save_config(self):
         """Save current cameras and active selection to cameras.json."""
         try:
@@ -510,17 +551,36 @@ class CameraManager:
             }
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
-            logger.info(f"Saved camera configuration to {self.config_path}")
+            self._last_mtime = os.path.getmtime(self.config_path)
+            logger.debug(f"Saved camera configuration to {self.config_path}")
         except Exception as e:
             logger.error(f"Failed to save {self.config_path}: {e}")
 
-    def scan_cameras(self) -> List[Dict[str, Any]]:
-        """Quickly probe all configured cameras and discover local USB devices."""
+    def scan_cameras(self, discover_new: bool = False) -> List[Dict[str, Any]]:
+        """Quickly probe configured cameras and optionally discover new local USB devices."""
         logger.info("Initiating dynamic camera scan...")
         results = []
 
-        # 1. Probe all cameras in registry
-        for cam_id, cam in self.cameras.items():
+        # Remove cameras that were previously discovered but are now disconnected
+        # (keep manually configured cameras like IP CCTV even if disconnected)
+        if discover_new:
+            stale_ids = []
+            for cam_id, cam in list(self.cameras.items()):
+                if cam.type == "usb" and cam.id.startswith("usb_discovered_"):
+                    alive, _, _ = probe_source(cam.source, timeout=1.0)
+                    if not alive:
+                        stale_ids.append(cam_id)
+            for sid in stale_ids:
+                del self.cameras[sid]
+
+        # 1. Probe cameras configured in registry
+        for cam_id, cam in list(self.cameras.items()):
+            if not cam.enabled:
+                cam.status = "DISABLED"
+                cam.error_message = "Disabled by configuration"
+                results.append(cam.to_dict())
+                continue
+
             alive, msg, res = probe_source(cam.source)
             cam.status = "CONNECTED" if alive else "NOT_CONNECTED"
             cam.error_message = msg if not alive else ""
@@ -529,20 +589,26 @@ class CameraManager:
                 cam.last_seen = time.time()
             results.append(cam.to_dict())
 
-        # 2. Discover any additional USB webcams not yet in registry
-        for idx in range(4):
-            idx_str = str(idx)
-            existing = any(c.source == idx_str for c in self.cameras.values())
-            if not existing:
+        # 2. Discover additional USB webcams when user clicks "Scan Hardware"
+        if discover_new or len(self.cameras) == 0:
+            known_sources = {c.source for c in self.cameras.values()}
+            for idx in range(5):
+                idx_str = str(idx)
+                if idx_str in known_sources:
+                    continue
+                # On Windows, index 1 is often a secondary filter of index 0 (same physical sensor)
+                if idx == 1 and sys.platform == "win32" and "0" in known_sources:
+                    continue
                 alive, msg, res = probe_source(idx_str, timeout=1.0)
                 if alive:
                     new_id = f"usb_{idx}"
+                    cam_name = f"External USB Webcam (Port {idx})" if idx > 0 else "Built-in Laptop Webcam"
                     new_cam = CameraInfo(
                         id=new_id,
-                        name=f"Discovered USB Webcam {idx}",
+                        name=cam_name,
                         type="usb",
                         source=idx_str,
-                        location="Local Port",
+                        location="USB External Port" if idx > 0 else "Laptop",
                         status="CONNECTED",
                         resolution=res,
                         last_seen=time.time(),

@@ -1,6 +1,6 @@
 # AI Security & Safety Surveillance System
 
-A computer vision system for real-time Personal Protective Equipment (PPE) detection, restricted zone monitoring, and CCTV stream supervision. Built on a self-trained YOLOv8 neural network and an OpenCV video processing pipeline.
+A computer vision system for real-time Personal Protective Equipment (PPE) detection, restricted zone monitoring, and CCTV stream supervision. Built on a self-trained YOLOv8 neural network, an OpenCV video processing pipeline, and a **Zero-Trust safety compliance model**.
 
 Supports dedicated IP cameras (RTSP/HTTP), USB video devices, dynamic hardware discovery, and real-time dashboard monitoring.
 
@@ -23,7 +23,9 @@ Supports dedicated IP cameras (RTSP/HTTP), USB video devices, dynamic hardware d
                       │  - 6 Classes: Person, Helmet, No_Helmet,     │
                       │               Vest, No_Vest, BorderLine      │
                       │  - ByteTrack multi-object worker tracking    │
-                      │  - Far-distance CCTV crop zoom analysis      │
+                      │  - Zero-Trust PPE compliance model           │
+                      │  - OpenCV crop zoom with INTER_CUBIC upscale │
+                      │  - IoU-based spatial track continuity        │
                       └──────────────────────┬───────────────────────┘
                                              │
                                              ▼
@@ -39,10 +41,30 @@ Supports dedicated IP cameras (RTSP/HTTP), USB video devices, dynamic hardware d
                       ┌──────────────────────────────────────────────┐
                       │        Command Center & Audit Feeds          │
                       │  - Web Dashboard (http://localhost:8080)     │
-                      │  - Dynamic camera health grid (FPS/status)   │
+                      │  - Dynamic alert banner (green/red)          │
                       │  - CSV incident audit logging (events.csv)   │
                       └──────────────────────────────────────────────┘
 ```
+
+---
+
+## Zero-Trust Safety Model
+
+The system applies a **Zero-Trust** compliance rule: a worker is classified as **COMPLIANT** only when **both** helmet **and** vest are verified as `PRESENT`. In every other case — missing, unverified, or conflicting evidence — the worker is classified as **NON_COMPLIANT**.
+
+There is no intermediate "UNKNOWN" overall status. This eliminates ambiguity for safety supervisors and ensures any doubt defaults to a safety violation.
+
+### PPE Compliance Cases
+
+| Case | Helmet | Vest | Overall Status | Box Color | Event Type |
+|------|--------|------|----------------|-----------|------------|
+| Full PPE | PRESENT | PRESENT | **COMPLIANT** | 🟢 Green | `PPE_COMPLIANT_CROSSING` |
+| Helmet only | PRESENT | MISSING / UNKNOWN | **NON_COMPLIANT** | 🔴 Red | `PPE_NONCOMPLIANT_CROSSING` |
+| Vest only | MISSING / UNKNOWN | PRESENT | **NON_COMPLIANT** | 🔴 Red | `PPE_NONCOMPLIANT_CROSSING` |
+| No PPE | MISSING | MISSING | **NON_COMPLIANT** | 🔴 Red | `PPE_NONCOMPLIANT_CROSSING` |
+
+> [!IMPORTANT]
+> The model detects **high-visibility safety vests** (class `Vest`), not regular jackets or coats. Workers must wear a proper hi-vis vest to be marked compliant.
 
 ---
 
@@ -85,6 +107,9 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+### 4. Verify Model Weights
+Ensure the trained model file exists at `weights/my_custom_ppe.pt`. If you need to retrain, see [Model Training](#model-training-train_custom_ppepy) below.
+
 ---
 
 ## Camera Configuration (`cameras.json`)
@@ -97,10 +122,19 @@ All camera endpoints are defined in [`cameras.json`](file:///c:/Users/sachi/Down
   "cameras": [
     {
       "id": "usb_0",
-      "name": "Local Safety Webcam",
+      "name": "Built-in Laptop Webcam",
       "type": "usb",
       "source": "0",
-      "location": "Control Room / Safety Desk",
+      "location": "Laptop Integrated",
+      "enabled": true,
+      "reconnect_interval_sec": 3.0
+    },
+    {
+      "id": "usb_2",
+      "name": "External USB Webcam",
+      "type": "usb",
+      "source": "2",
+      "location": "USB External Port",
       "enabled": true,
       "reconnect_interval_sec": 3.0
     },
@@ -151,16 +185,38 @@ python ppe_webcam_poc.py --camera "rtsp://admin:password@192.168.1.100:554/live"
 To explicitly target a specific local USB camera index:
 ```bash
 python ppe_webcam_poc.py --camera 0   # Built-in laptop webcam
-python ppe_webcam_poc.py --camera 1   # External USB webcam
+python ppe_webcam_poc.py --camera 2   # External USB webcam (or cycle with 'C' key live)
 ```
 *(Note: Ensure you use the singular flag `--camera`, not `--cameras`).*
 
-### 5. Launch the Web Command Center Dashboard
-In a separate terminal, start the local monitoring dashboard:
+### 5. Recommended Settings for Different Scenarios
+
+| Scenario | Command | Notes |
+|----------|---------|-------|
+| Close-up webcam (desk) | `python ppe_webcam_poc.py --camera 0` | Default settings work well at short range |
+| Wide CCTV / distant workers | `python ppe_webcam_poc.py --camera 0 --imgsz 1280 --conf 0.25` | Higher input resolution + lower confidence for distant workers |
+| Debug (show raw detections) | `python ppe_webcam_poc.py --camera 0 --show-detections` | Shows all YOLO bounding boxes before filtering |
+
+### 6. Launch the Web Dashboard
+In a **separate terminal**, start the local monitoring dashboard:
 ```bash
 python dashboard.py --port 8080
 ```
 Open **[http://localhost:8080](http://localhost:8080)** in any browser.
+
+### Full Demo (Two Terminals)
+
+**Terminal 1 — Monitoring:**
+```bash
+python ppe_webcam_poc.py --camera 0
+```
+**Terminal 2 — Dashboard:**
+```bash
+python dashboard.py --port 8080
+```
+
+> [!TIP]
+> Press **D** in the live monitoring window to auto-open the dashboard in your default browser.
 
 ---
 
@@ -179,14 +235,36 @@ Open **[http://localhost:8080](http://localhost:8080)** in any browser.
 | **Q or Esc** | Terminate monitoring process |
 | **Mouse Drag** | Click and drag safety borders directly on video feed |
 
+The HUD shows two clickable buttons at the top of the frame:
+- **Events (N)** — Click to toggle the event drawer (where N = event count)
+- **Dashboard (D)** — Click to open the web dashboard
+
 ---
 
 ## Stream Fault Tolerance & Connection Handling
 
+- **Hardware Resolution Auto-Negotiation:** Probes and negotiates the camera's highest native resolution (1080p FHD, 720p HD, or 480p) dynamically, adapting automatically across different laptop hardware.
 - **Fast TCP Pre-Check:** Network endpoints are tested with a 0.8s socket handshake before opening video capture, preventing OpenCV thread locking.
 - **Buffer Flush:** Uses `nobuffer` and low packet buffering to prevent latency accumulation on continuous RTSP CCTV streams.
 - **Disconnected Fallback Screen:** If a network drop occurs, the OpenCV display switches to an offline diagnostic frame with a countdown timer, attempting background reconnection without terminating the application.
-- **Far-Distance CCTV Zoom:** The `--enhance-distant-workers` flag crops distant worker regions (height 45–300px) and applies secondary high-resolution inference to ensure helmet and vest detection at long ranges.
+- **Far-Distance Crop Enhancement:** When a worker has missing or unverified PPE evidence, their bounding box region is cropped from the full frame, upscaled using OpenCV bicubic interpolation (`cv2.INTER_CUBIC`) to a minimum 320px target, and re-inferred through YOLO at a lower confidence threshold. This recovers helmet and vest detections for workers who appear small on wide-angle CCTV feeds. The crop uses 20% horizontal and 15% vertical padding for better context.
+- **Adaptive Confidence Thresholds:** Distant workers (bounding box height ≤ 320px) are accepted at a lower person-detection confidence, while close-up workers use the full confidence threshold. This prevents dropping valid detections at range.
+- **IoU-Based Track Continuity:** When ByteTrack reassigns a worker's track ID (due to occlusion or brief frame loss), the system uses spatial IoU overlap (> 0.30) to match the new detection to recent tracks within a 1.8s window, inheriting accumulated PPE evidence history. This prevents compliance status resets from tracker ID churn.
+
+---
+
+## Web Dashboard
+
+The dashboard at `http://localhost:8080` auto-refreshes every 2 seconds and displays:
+
+- **Stats Grid:** Total events, violations, compliant entries, and compliance rate.
+- **Dynamic Alert Banner:**
+  - 🟢 **Green** — "ALL WORKERS COMPLIANT" when the latest event shows full PPE compliance.
+  - 🔴 **Red** — "NON-COMPLIANT" with worker details when a violation is detected.
+- **Event Table:** Scrollable list of all logged events with color-coded status tags:
+  - **COMPLIANT** (green badge) — Worker verified with both helmet and vest.
+  - **NON_COMPLIANT** (red badge) — Any PPE item missing or unverified.
+- **Camera Health Grid:** Live FPS and connection status for all configured cameras.
 
 ---
 
@@ -221,6 +299,25 @@ Expected output:
 Ran 24 tests in 1.15s
 OK
 ```
+
+Key test cases:
+- **Zero-Trust compliance logic:** Verifies that `overall_status()` returns `COMPLIANT` only when both helmet and vest are `PRESENT`, and `NON_COMPLIANT` for all other combinations.
+- **Event logging:** Validates that both compliant and non-compliant events are written to CSV and counted correctly in dashboard stats.
+- **Boundary / tripwire logic:** Confirms zone crossing detection and dual-border tracking.
+- **Camera manager resilience:** Tests reconnection, health monitoring, and failover screens.
+
+---
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| No detections on distant workers | Default confidence too high for small bounding boxes | Use `--conf 0.25` and `--imgsz 1280` |
+| Dashboard shows 0 events | `events.csv` missing or monitoring not running | Start monitoring first, then open dashboard |
+| Dashboard shows old "UNKNOWN" events | Legacy events from before Zero-Trust update | Delete or archive `events.csv` to start fresh |
+| `?` characters in the HUD | Emoji rendering issue with OpenCV | Already fixed — HUD uses ASCII text labels |
+| Track ID keeps changing | ByteTrack losing identity during fast motion | IoU track continuity handles this automatically |
+| Worker shown as NON_COMPLIANT despite wearing vest | Model only detects hi-vis safety vests, not regular jackets | Worker must wear a high-visibility safety vest |
 
 ---
 

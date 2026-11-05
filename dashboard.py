@@ -21,6 +21,11 @@ import json
 import logging
 import os
 import sys
+
+# Suppress low-level OpenCV C++ stderr logs during camera probes
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
+
 from datetime import datetime, timezone
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -56,11 +61,21 @@ def read_events(csv_path: Path) -> List[Dict[str, str]]:
 
 
 def compute_stats(events: List[Dict[str, str]]) -> Dict[str, Any]:
-    """Compute summary statistics from events."""
+    """Compute summary statistics from events (Zero-Trust safety model)."""
     total = len(events)
-    violations = sum(1 for e in events if e.get("event_type") == "PPE_NONCOMPLIANT_CROSSING")
-    compliant = sum(1 for e in events if e.get("event_type") == "PPE_COMPLIANT_CROSSING")
-    unknown = sum(1 for e in events if e.get("event_type") == "PPE_UNKNOWN_AT_CROSSING")
+    violations = 0
+    compliant = 0
+    unknown = 0
+
+    for e in events:
+        ev_type = e.get("event_type", "")
+        ov_status = e.get("overall_status", "")
+        if "COMPLIANT" in ev_type and "NON" not in ev_type and ov_status != "NON_COMPLIANT":
+            compliant += 1
+        else:
+            violations += 1
+            if "UNKNOWN" in ev_type or ov_status == "UNKNOWN":
+                unknown += 1
 
     cameras: Dict[str, Dict[str, int]] = {}
     for e in events:
@@ -68,12 +83,14 @@ def compute_stats(events: List[Dict[str, str]]) -> Dict[str, Any]:
         if cam not in cameras:
             cameras[cam] = {"total": 0, "violations": 0, "compliant": 0, "unknown": 0}
         cameras[cam]["total"] += 1
-        if e.get("event_type") == "PPE_NONCOMPLIANT_CROSSING":
-            cameras[cam]["violations"] += 1
-        elif e.get("event_type") == "PPE_COMPLIANT_CROSSING":
+        ev_type = e.get("event_type", "")
+        ov_status = e.get("overall_status", "")
+        if "COMPLIANT" in ev_type and "NON" not in ev_type and ov_status != "NON_COMPLIANT":
             cameras[cam]["compliant"] += 1
-        elif e.get("event_type") == "PPE_UNKNOWN_AT_CROSSING":
-            cameras[cam]["unknown"] += 1
+        else:
+            cameras[cam]["violations"] += 1
+            if "UNKNOWN" in ev_type or ov_status == "UNKNOWN":
+                cameras[cam]["unknown"] += 1
 
     compliance_rate = (compliant / total * 100) if total > 0 else 0.0
 
@@ -183,25 +200,46 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   /* Alert Banner */
   .alert-banner {
-    background: linear-gradient(90deg, rgba(239,68,68,0.25), rgba(185,28,28,0.35));
-    border: 1px solid rgba(239,68,68,0.6);
     border-radius: 12px;
     padding: 14px 20px;
     margin-bottom: 22px;
     display: flex;
     align-items: center;
     gap: 16px;
+    transition: all 0.3s ease;
+  }
+  .alert-banner.violation {
+    background: linear-gradient(90deg, rgba(239,68,68,0.25), rgba(185,28,28,0.35));
+    border: 1px solid rgba(239,68,68,0.6);
     box-shadow: 0 0 25px rgba(239,68,68,0.25);
     animation: alertPulse 1.5s infinite;
   }
+  .alert-banner.violation .alert-title { color: #f87171; }
+  .alert-banner.violation .alert-desc { color: #fca5a5; }
+  .alert-banner.violation .alert-meta { color: #f87171; }
+
+  .alert-banner.compliant {
+    background: linear-gradient(90deg, rgba(16,185,129,0.25), rgba(5,150,105,0.35));
+    border: 1px solid rgba(16,185,129,0.6);
+    box-shadow: 0 0 25px rgba(16,185,129,0.25);
+    animation: compliantPulse 2s infinite;
+  }
+  .alert-banner.compliant .alert-title { color: #34d399; }
+  .alert-banner.compliant .alert-desc { color: #a7f3d0; }
+  .alert-banner.compliant .alert-meta { color: #34d399; }
+
   @keyframes alertPulse {
     0%, 100% { box-shadow: 0 0 15px rgba(239,68,68,0.25); border-color: rgba(239,68,68,0.5); }
     50% { box-shadow: 0 0 35px rgba(239,68,68,0.6); border-color: rgba(239,68,68,0.9); }
   }
+  @keyframes compliantPulse {
+    0%, 100% { box-shadow: 0 0 15px rgba(16,185,129,0.25); border-color: rgba(16,185,129,0.5); }
+    50% { box-shadow: 0 0 30px rgba(16,185,129,0.5); border-color: rgba(16,185,129,0.8); }
+  }
   .alert-icon { font-size: 2rem; }
-  .alert-title { font-weight: 800; font-size: 0.95rem; color: #f87171; letter-spacing: 0.3px; }
-  .alert-desc { font-size: 0.82rem; color: #fca5a5; margin-top: 2px; }
-  .alert-meta { margin-left: auto; font-size: 0.75rem; color: #f87171; font-weight: 600; text-align: right; }
+  .alert-title { font-weight: 800; font-size: 0.95rem; letter-spacing: 0.3px; }
+  .alert-desc { font-size: 0.82rem; margin-top: 2px; }
+  .alert-meta { margin-left: auto; font-size: 0.75rem; font-weight: 600; text-align: right; }
 
   /* Stats Grid */
   .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 16px; margin-bottom: 24px; }
@@ -385,8 +423,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
   </header>
 
-  <div class="alert-banner" id="alert-banner" style="display: none;">
-    <div class="alert-icon">🚨</div>
+  <div class="alert-banner violation" id="alert-banner" style="display: none;">
+    <div class="alert-icon" id="alert-icon">🚨</div>
     <div>
       <div class="alert-title" id="alert-title">NON-COMPLIANT WORKER CROSSING DETECTED</div>
       <div class="alert-desc" id="alert-desc">An unauthorized entry was logged without required PPE equipment.</div>
@@ -421,10 +459,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   <!-- Compliance Stats Grid -->
   <div class="stats-grid" id="stats-grid">
-    <div class="stat-card blue"><div class="stat-label">Total Crossings</div><div class="stat-value blue" id="stat-total">—</div><div class="stat-sub">Tracked entry crossings</div></div>
-    <div class="stat-card red"><div class="stat-label">Violations</div><div class="stat-value red" id="stat-violations">—</div><div class="stat-sub">Non-compliant events</div></div>
-    <div class="stat-card green"><div class="stat-label">Compliance Rate</div><div class="stat-value green" id="stat-rate">—</div><div class="stat-sub">PPE adherence percentage</div></div>
-    <div class="stat-card amber"><div class="stat-label">Unknown Evidence</div><div class="stat-value amber" id="stat-unknown">—</div><div class="stat-sub">Unresolved PPE state</div></div>
+    <div class="stat-card blue"><div class="stat-label">Total Crossings</div><div class="stat-value blue" id="stat-total">0</div><div class="stat-sub">Tracked zone crossings</div></div>
+    <div class="stat-card green"><div class="stat-label">Compliant Entries</div><div class="stat-value green" id="stat-compliant">0</div><div class="stat-sub">Verified PPE adherent</div></div>
+    <div class="stat-card red"><div class="stat-label">Violations</div><div class="stat-value red" id="stat-violations">0</div><div class="stat-sub">Non-compliant events</div></div>
+    <div class="stat-card green"><div class="stat-label">Compliance Rate</div><div class="stat-value green" id="stat-rate">0%</div><div class="stat-sub">Safety adherence percentage</div></div>
   </div>
 
   <div class="main-grid">
@@ -494,16 +532,15 @@ async function triggerDynamicScan() {
 }
 
 function eventTypeTag(type) {
-  if (type === 'PPE_NONCOMPLIANT_CROSSING') return '<span class="tag tag-red">NON-COMPLIANT</span>';
-  if (type === 'PPE_COMPLIANT_CROSSING') return '<span class="tag tag-green">COMPLIANT</span>';
-  if (type === 'PPE_UNKNOWN_AT_CROSSING') return '<span class="tag tag-amber">UNKNOWN</span>';
-  return `<span class="tag tag-gray">${type}</span>`;
+  if (type === 'PPE_COMPLIANT_CROSSING' || (type && type.includes('COMPLIANT') && !type.includes('NON'))) {
+    return '<span class="tag tag-green">COMPLIANT</span>';
+  }
+  return '<span class="tag tag-red">NON-COMPLIANT</span>';
 }
 
 function statusTag(status) {
   if (status === 'PRESENT') return '<span class="tag tag-green">✓</span>';
-  if (status === 'MISSING') return '<span class="tag tag-red">✗</span>';
-  return '<span class="tag tag-gray">?</span>';
+  return '<span class="tag tag-red">✗</span>';
 }
 
 function formatTime(ts) {
@@ -619,22 +656,40 @@ async function refresh() {
     if (respEvents.ok) {
       const data = await respEvents.json();
       document.getElementById('stat-total').textContent = data.stats.total_crossings;
+      document.getElementById('stat-compliant').textContent = data.stats.compliant;
       document.getElementById('stat-violations').textContent = data.stats.violations;
       document.getElementById('stat-rate').textContent = data.stats.compliance_rate + '%';
-      document.getElementById('stat-unknown').textContent = data.stats.unknown;
       document.getElementById('event-count').textContent = data.stats.total_crossings + ' events';
       document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
 
       renderEvents(data.events);
 
       const banner = document.getElementById('alert-banner');
-      const recentViolations = (data.events || []).filter(e => e.event_type === 'PPE_NONCOMPLIANT_CROSSING');
-      if (recentViolations.length > 0) {
-        const latest = recentViolations[0];
-        document.getElementById('alert-desc').textContent = `Non-compliant entry recorded on Camera ${latest.camera || '0'}.`;
-        document.getElementById('alert-cam').textContent = `${latest.camera || '0'}`;
-        document.getElementById('alert-time').textContent = formatTime(latest.timestamp_utc);
+      const alertIcon = document.getElementById('alert-icon');
+      const alertTitle = document.getElementById('alert-title');
+      const alertDesc = document.getElementById('alert-desc');
+      const alertCam = document.getElementById('alert-cam');
+      const alertTime = document.getElementById('alert-time');
+
+      if (data.events && data.events.length > 0) {
+        const latest = data.events[0];
+        const isCompliant = (latest.event_type === 'PPE_COMPLIANT_CROSSING' || (latest.event_type && latest.event_type.includes('COMPLIANT') && !latest.event_type.includes('NON')));
+
         banner.style.display = 'flex';
+        alertCam.textContent = `Camera ${latest.camera || '0'}`;
+        alertTime.textContent = formatTime(latest.timestamp_utc);
+
+        if (isCompliant) {
+          banner.className = 'alert-banner compliant';
+          alertIcon.textContent = '✅';
+          alertTitle.textContent = 'ALL WORKERS COMPLIANT — REQUIRED PPE VERIFIED';
+          alertDesc.textContent = `Worker #${latest.track_id || '?'} verified compliant with Helmet & Safety Jacket.`;
+        } else {
+          banner.className = 'alert-banner violation';
+          alertIcon.textContent = '🚨';
+          alertTitle.textContent = 'NON-COMPLIANT WORKER CROSSING DETECTED';
+          alertDesc.textContent = `Non-compliant entry recorded on Camera ${latest.camera || '0'} (Worker #${latest.track_id || '?'}, Helmet: ${latest.helmet_status || 'MISSING'}, Vest: ${latest.vest_status || 'MISSING'}).`;
+        }
       } else {
         banner.style.display = 'none';
       }
@@ -696,11 +751,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self._send_json(payload)
 
     def _serve_cameras_api(self) -> None:
+        camera_manager.load_config()
         summary = camera_manager.get_status_summary()
         self._send_json(json.dumps(summary, ensure_ascii=False))
 
     def _serve_cameras_scan(self) -> None:
-        camera_manager.scan_cameras()
+        camera_manager.scan_cameras(discover_new=True)
         summary = camera_manager.get_status_summary()
         self._send_json(json.dumps(summary, ensure_ascii=False))
 
@@ -728,7 +784,7 @@ def main() -> int:
     print(f" Dashboard URL : http://localhost:{args.port}")
     print(f" Events Log    : {Path(args.events).resolve()}")
     print(" Initializing camera scan...")
-    camera_manager.scan_cameras()
+    camera_manager.scan_cameras(discover_new=False)
     print(f" Configured Cameras: {len(camera_manager.cameras)}")
     print(" Press Ctrl+C to stop.")
     print("=" * 65)

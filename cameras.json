@@ -6,31 +6,31 @@
       "name": "Local Safety Webcam",
       "type": "usb",
       "source": "0",
-      "location": "Control Room / Safety Desk",
+      "location": "Safety Desk",
       "enabled": true,
       "reconnect_interval_sec": 3.0,
-      "description": "Primary USB video capture device",
+      "description": "",
       "status": "CONNECTED",
-      "last_seen": 1793543832.5328794,
+      "last_seen": 1793857178.0548584,
       "fps": 0.0,
       "resolution": [
-        640,
-        480
+        1920,
+        1080
       ],
       "consecutive_failures": 0,
       "error_message": "",
-      "last_seen_str": "2026-11-01 20:07:12"
+      "last_seen_str": "2026-11-05 11:09:38"
     },
     {
       "id": "cctv_entrance",
       "name": "Dedicated IP CCTV (RTSP)",
       "type": "ip",
       "source": "rtsp://admin:pass@192.168.1.100:554/live",
-      "location": "Main Entrance / Gate 1",
+      "location": "Main Entrance",
       "enabled": true,
-      "reconnect_interval_sec": 4.0,
-      "description": "Dedicated IP Camera with RTSP network stream",
-      "status": "NOT_CONNECTED",
+      "reconnect_interval_sec": 3.0,
+      "description": "",
+      "status": "RECONNECTING",
       "last_seen": 0.0,
       "fps": 0.0,
       "resolution": [
@@ -42,16 +42,16 @@
       "last_seen_str": "Never"
     },
     {
-      "id": "usb_1",
-      "name": "Discovered USB Webcam 1",
+      "id": "usb_2",
+      "name": "External USB Webcam (Port 2)",
       "type": "usb",
-      "source": "1",
-      "location": "Local Port",
+      "source": "2",
+      "location": "USB External Port",
       "enabled": true,
       "reconnect_interval_sec": 3.0,
       "description": "",
       "status": "CONNECTED",
-      "last_seen": 1793543833.731077,
+      "last_seen": 1793857180.3469944,
       "fps": 0.0,
       "resolution": [
         1280,
@@ -59,7 +59,7 @@
       ],
       "consecutive_failures": 0,
       "error_message": "",
-      "last_seen_str": "2026-11-01 20:07:13"
+      "last_seen_str": "2026-11-05 11:09:40"
     }
   ]
 }
